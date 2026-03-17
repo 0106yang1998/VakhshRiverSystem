@@ -26,7 +26,7 @@ VakhshRiverSystem/
 │  ├─ monitoring/                     # 水文监测
 │  ├─ reservoir_estimation/           # 库区水量估算
 │  ├─ routing/                        # 洪水演进与汇流
-│  ├─ segformer_service/              # SegFormer推理服务
+│  ├─ segformer_service/              # SegFormer推理服务（水体/积雪识别）
 │  ├─ swe/                            # 雪水当量估算
 │  ├─ warning/                        # 洪水预警监控
 │  ├─ water_allocation/               # 水资源分配优化
@@ -458,7 +458,7 @@ plugins/new_module_plugin/
 ```python
 class ModulePlugin:
 
-    def name(self):
+    class Plugin(BasePlugin):
         return "模块名称"
 
     def widget(self):
@@ -467,19 +467,7 @@ class ModulePlugin:
 
 ---
 
-# 九、注意事项
-
-开发建议：
-
-- 插件统一使用包路径导入
-- 不要创建多个 QApplication
-- AI 模块建议独立环境
-- 路径建议使用绝对路径
-- GUI 与算法分离
-
----
-
-# 十二、项目说明
+# 九、项目说明
 
 **VakhshRiverSystem**
 
