@@ -200,6 +200,136 @@ def era5_nc_to_geotiff(era5_zip_path, out_tp_tif, out_swvl1_tif):
     print("  -", out_swvl1_tif)
 
 # 微软的 Planetary Computer 获取 ESA 的 10 米分辨率全球土地覆盖数据
+def _resolve_era5_nc_path(era5_source_path):
+    import os
+    import zipfile
+
+    if not os.path.exists(era5_source_path):
+        raise FileNotFoundError(f"ERA5 source not found: {era5_source_path}")
+
+    if era5_source_path.lower().endswith(".nc"):
+        return era5_source_path
+
+    if not era5_source_path.lower().endswith(".zip"):
+        raise ValueError(f"Unsupported ERA5 file format: {era5_source_path}")
+
+    extract_dir = os.path.splitext(era5_source_path)[0] + "_unzipped"
+    os.makedirs(extract_dir, exist_ok=True)
+    with zipfile.ZipFile(era5_source_path, "r") as z:
+        z.extractall(extract_dir)
+
+    nc_files = []
+    for root, _, files in os.walk(extract_dir):
+        for fn in files:
+            if fn.lower().endswith(".nc"):
+                nc_files.append(os.path.join(root, fn))
+
+    if not nc_files:
+        raise RuntimeError(f"No .nc found in ERA5 archive: {era5_source_path}")
+
+    return nc_files[0]
+
+
+def _find_time_dim(ds):
+    for dim_name in ds.dims:
+        if "time" in dim_name.lower():
+            return dim_name
+    raise RuntimeError("Could not find ERA5 time dimension.")
+
+
+def _write_dataarray_tif(da, out_path):
+    import rioxarray  # noqa
+
+    if "latitude" in da.dims and "longitude" in da.dims:
+        da = da.rename({"latitude": "y", "longitude": "x"})
+    elif "lat" in da.dims and "lon" in da.dims:
+        da = da.rename({"lat": "y", "lon": "x"})
+
+    if da["y"][0] < da["y"][-1]:
+        da = da.sortby("y", ascending=False)
+
+    da = da.astype("float32")
+    da.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
+    da.rio.write_crs("EPSG:4326", inplace=True)
+    da.rio.to_raster(out_path)
+
+
+def era5_nc_to_daily_geotiffs(era5_source_path, out_dir):
+    import numpy as np
+    import xarray as xr
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    nc_path = _resolve_era5_nc_path(era5_source_path)
+    print("[ERA5] Using NetCDF:", nc_path)
+
+    ds = xr.open_dataset(nc_path, engine="netcdf4")
+    time_dim = _find_time_dim(ds)
+
+    tp_daily = ds["tp"].resample({time_dim: "1D"}).sum() * 1000.0
+    swvl1_daily = ds["swvl1"].resample({time_dim: "1D"}).mean()
+
+    outputs = {
+        "rain_raw_files": [],
+        "soil_raw_files": [],
+    }
+
+    for timestamp in tp_daily[time_dim].values:
+        date_str = np.datetime_as_string(timestamp, unit="D")
+        compact_date = date_str.replace("-", "")
+
+        rain_out = os.path.join(out_dir, f"era5_tp_mm_{compact_date}.tif")
+        soil_out = os.path.join(out_dir, f"era5_swvl1_mean_{compact_date}.tif")
+
+        if not os.path.exists(rain_out):
+            _write_dataarray_tif(tp_daily.sel({time_dim: timestamp}), rain_out)
+        if not os.path.exists(soil_out):
+            _write_dataarray_tif(swvl1_daily.sel({time_dim: timestamp}), soil_out)
+
+        outputs["rain_raw_files"].append(rain_out)
+        outputs["soil_raw_files"].append(soil_out)
+
+    print(f"[ERA5] Daily GeoTIFF count: {len(outputs['rain_raw_files'])}")
+    return outputs
+
+
+def _extract_daily_token(path):
+    name = os.path.basename(path)
+    digits = "".join(ch for ch in name if ch.isdigit())
+    for idx in range(len(digits) - 7):
+        token = digits[idx:idx + 8]
+        if token.startswith("20"):
+            return f"{token[:4]}-{token[4:6]}-{token[6:8]}"
+    raise ValueError(f"Could not extract date from file name: {path}")
+
+
+def match_daily_era5_to_dem_grid(rain_raw_files, soil_raw_files, dem_tif, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+
+    outputs = {
+        "rain_daily_files": [],
+        "soil_daily_files": [],
+    }
+
+    for raw_path in rain_raw_files:
+        date_token = _extract_daily_token(raw_path)
+        out_path = os.path.join(out_dir, f"rain_mm_demgrid_{date_token}.tif")
+        if not os.path.exists(out_path):
+            match_dem_grid(raw_path, dem_tif, out_path, resampling=Resampling.bilinear)
+            print("[ERA5] Matched rainfall to DEM grid:", out_path)
+        outputs["rain_daily_files"].append(out_path)
+
+    for raw_path in soil_raw_files:
+        date_token = _extract_daily_token(raw_path)
+        out_path = os.path.join(out_dir, f"soil_moist_demgrid_{date_token}.tif")
+        if not os.path.exists(out_path):
+            match_dem_grid(raw_path, dem_tif, out_path, resampling=Resampling.bilinear)
+            print("[ERA5] Matched soil moisture to DEM grid:", out_path)
+        outputs["soil_daily_files"].append(out_path)
+
+    return outputs
+
+
 def download_worldcover_to_demgrid(dem_tif, out_tif):
     """
     Download ESA WorldCover tiles from Planetary Computer and directly resample/reproject
@@ -402,20 +532,15 @@ def main():
     if not os.path.exists(era5_nc):
         download_era5_land_nc(era5_nc)
 
-    tp_tif_raw = os.path.join(CFG["raw_dir"], f"era5_tp_mm_{CFG['era5_year']}{CFG['era5_month']}.tif")
-    swvl1_tif_raw = os.path.join(CFG["raw_dir"], f"era5_swvl1_mean_{CFG['era5_year']}{CFG['era5_month']}.tif")
-    if not (os.path.exists(tp_tif_raw) and os.path.exists(swvl1_tif_raw)):
-        era5_nc_to_geotiff(era5_nc, tp_tif_raw, swvl1_tif_raw)
-
-    # Match to DEM grid
-    tp_tif = os.path.join(CFG["proc_dir"], "rain_mm_demgrid.tif")
-    swvl1_tif = os.path.join(CFG["proc_dir"], "soil_moist_demgrid.tif")
-    if not os.path.exists(tp_tif):
-        match_dem_grid(tp_tif_raw, dem_clip, tp_tif, resampling=Resampling.bilinear)
-        print("[ERA5] Matched rainfall to DEM grid:", tp_tif)
-    if not os.path.exists(swvl1_tif):
-        match_dem_grid(swvl1_tif_raw, dem_clip, swvl1_tif, resampling=Resampling.bilinear)
-        print("[ERA5] Matched soil moisture to DEM grid:", swvl1_tif)
+    raw_daily_dir = os.path.join(CFG["raw_dir"], "daily")
+    proc_daily_dir = os.path.join(CFG["proc_dir"], "daily")
+    daily_raw_outputs = era5_nc_to_daily_geotiffs(era5_nc, raw_daily_dir)
+    daily_proc_outputs = match_daily_era5_to_dem_grid(
+        daily_raw_outputs["rain_raw_files"],
+        daily_raw_outputs["soil_raw_files"],
+        dem_clip,
+        proc_daily_dir,
+    )
 
     # WorldCover landuse
     wc_tif = os.path.join(CFG["proc_dir"], "landcover_demgrid.tif")
@@ -431,8 +556,10 @@ def main():
         download_hydrorivers(study, rivers_gpkg)
 
     print("\nAll data prepared in:", CFG["proc_dir"])
-    print(raster_stats(swvl1_tif_raw))
-    print(raster_stats(swvl1_tif))
+    if daily_raw_outputs["soil_raw_files"]:
+        print(raster_stats(daily_raw_outputs["soil_raw_files"][0]))
+    if daily_proc_outputs["soil_daily_files"]:
+        print(raster_stats(daily_proc_outputs["soil_daily_files"][0]))
 
 
 if __name__ == "__main__":
