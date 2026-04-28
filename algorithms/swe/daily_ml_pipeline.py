@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import math
 import os
+import shutil
+import sys
 import tempfile
 import warnings
 import zipfile
@@ -11,10 +14,13 @@ from datetime import date, datetime, time, timedelta, timezone
 from io import StringIO
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import joblib
+from matplotlib import colormaps
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 import requests
@@ -32,8 +38,11 @@ import rasterio.warp
 
 try:
     import h5py
-except ImportError:
+except ImportError as exc:
     h5py = None
+    H5PY_IMPORT_ERROR = exc
+else:
+    H5PY_IMPORT_ERROR = None
 
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "4")
 warnings.filterwarnings(
@@ -41,6 +50,57 @@ warnings.filterwarnings(
     message="In a future version of xarray decode_timedelta will default to False.*",
     category=FutureWarning,
 )
+
+
+def _describe_h5py_runtime() -> str:
+    if h5py is None:
+        error_detail = repr(H5PY_IMPORT_ERROR) if H5PY_IMPORT_ERROR is not None else "unknown"
+        return f"python={sys.executable}; h5py=unavailable; import_error={error_detail}"
+    version = getattr(h5py, "__version__", "unknown")
+    return f"python={sys.executable}; h5py={version}"
+
+
+_PROGRESS_CALLBACK: Callable[[dict[str, Any]], None] | None = None
+
+
+def emit_progress(
+    message: str,
+    *,
+    stage: str | None = None,
+    percent: float | None = None,
+) -> None:
+    callback = _PROGRESS_CALLBACK
+    if callback is None:
+        return
+
+    payload: dict[str, Any] = {"message": str(message)}
+    if stage:
+        payload["stage"] = stage
+    if percent is not None:
+        payload["percent"] = max(0.0, min(float(percent), 100.0))
+    try:
+        callback(payload)
+    except Exception:
+        return
+
+
+@contextmanager
+def progress_reporter(callback: Callable[[dict[str, Any]], None] | None):
+    global _PROGRESS_CALLBACK
+    previous = _PROGRESS_CALLBACK
+    _PROGRESS_CALLBACK = callback
+    try:
+        yield
+    finally:
+        _PROGRESS_CALLBACK = previous
+
+
+def _should_report_step(index: int, total: int, *, every: int = 1) -> bool:
+    if total <= 0:
+        return False
+    if index in (1, total):
+        return True
+    return every > 1 and index % every == 0
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -750,6 +810,142 @@ def save_raster(
     return str(output_path)
 
 
+def _load_boundary_segments() -> list[tuple[list[float], list[float]]]:
+    if not STUDY_AREA_PATH.exists():
+        return []
+    try:
+        reader = shapefile.Reader(str(STUDY_AREA_PATH))
+    except Exception:
+        return []
+
+    segments: list[tuple[list[float], list[float]]] = []
+    for shape_record in reader.shapes():
+        points = shape_record.points
+        parts = list(shape_record.parts) + [len(points)]
+        for start, end in zip(parts[:-1], parts[1:]):
+            segment = points[start:end]
+            if not segment:
+                continue
+            xs = [float(point[0]) for point in segment]
+            ys = [float(point[1]) for point in segment]
+            segments.append((xs, ys))
+    return segments
+
+
+def _load_raster_for_figure(raster_path: str | Path) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    with rasterio.open(raster_path) as dataset:
+        array = dataset.read(1).astype(np.float32)
+        nodata = dataset.nodata
+        if nodata is not None:
+            array[array == nodata] = np.nan
+        bounds = dataset.bounds
+    return array, (float(bounds.left), float(bounds.right), float(bounds.bottom), float(bounds.top))
+
+
+def _robust_range(values: np.ndarray, *, lower: float = 5.0, upper: float = 95.0) -> tuple[float, float]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    vmin, vmax = np.nanpercentile(finite, [lower, upper])
+    if np.isclose(vmin, vmax):
+        vmin = float(np.nanmin(finite))
+        vmax = float(np.nanmax(finite))
+        if np.isclose(vmin, vmax):
+            vmax = vmin + 1.0
+    return float(vmin), float(vmax)
+
+
+def save_temperature_comparison_figure(
+    business_date_value: date,
+    diagnostics: dict[str, Any],
+) -> str | None:
+    raw_path = diagnostics.get("temp_mean_raw_raster")
+    corrected_path = diagnostics.get("temp_mean_corrected_raster")
+    correction_path = diagnostics.get("temperature_correction_raster")
+    if not raw_path or not corrected_path or not correction_path:
+        return None
+
+    raw_array, extent = _load_raster_for_figure(raw_path)
+    corrected_array, _ = _load_raster_for_figure(corrected_path)
+    correction_array, _ = _load_raster_for_figure(correction_path)
+
+    combined_temperature = np.concatenate(
+        [
+            raw_array[np.isfinite(raw_array)],
+            corrected_array[np.isfinite(corrected_array)],
+        ]
+    )
+    temp_vmin, temp_vmax = _robust_range(combined_temperature, lower=5.0, upper=95.0)
+
+    correction_finite = correction_array[np.isfinite(correction_array)]
+    if correction_finite.size == 0:
+        correction_limit = 1.0
+    else:
+        correction_limit = float(np.nanpercentile(np.abs(correction_finite), 95))
+        correction_limit = max(correction_limit, float(np.nanmax(np.abs(correction_finite))), 0.5)
+
+    figure = Figure(figsize=(13.6, 4.6), tight_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(1, 3)
+    boundary_segments = _load_boundary_segments()
+    day_label = business_date_value.isoformat()
+
+    plots = [
+        {
+            "axis": axes[0],
+            "array": raw_array,
+            "title": "Raw Temperature",
+            "cmap": colormaps["coolwarm"],
+            "vmin": temp_vmin,
+            "vmax": temp_vmax,
+            "label": "°C",
+        },
+        {
+            "axis": axes[1],
+            "array": corrected_array,
+            "title": "DEM-Corrected Temperature",
+            "cmap": colormaps["coolwarm"],
+            "vmin": temp_vmin,
+            "vmax": temp_vmax,
+            "label": "°C",
+        },
+        {
+            "axis": axes[2],
+            "array": correction_array,
+            "title": "Temperature Delta",
+            "cmap": colormaps["RdBu_r"],
+            "vmin": -correction_limit,
+            "vmax": correction_limit,
+            "label": "°C",
+        },
+    ]
+
+    for plot in plots:
+        ax = plot["axis"]
+        image = ax.imshow(
+            np.ma.masked_invalid(plot["array"]),
+            extent=extent,
+            origin="upper",
+            cmap=plot["cmap"],
+            vmin=plot["vmin"],
+            vmax=plot["vmax"],
+            interpolation="nearest",
+        )
+        for xs, ys in boundary_segments:
+            ax.plot(xs, ys, color="#222222", linewidth=0.8, alpha=0.85)
+        ax.set_title(plot["title"])
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.grid(True, linestyle="--", linewidth=0.35, alpha=0.25)
+        figure.colorbar(image, ax=ax, fraction=0.045, pad=0.03, label=plot["label"])
+
+    figure.suptitle(f"Temperature DEM Correction Comparison ({day_label})", fontsize=13)
+    output_path = DIAGNOSTIC_RASTER_DIR / f"TempMeanComparison_C_{business_date_value.strftime('%Y%m%d')}.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    return str(output_path)
+
+
 def save_temperature_diagnostics(
     business_date_value: date,
     forcing: dict[str, Any],
@@ -846,6 +1042,13 @@ def save_temperature_diagnostics(
             ),
         }
     )
+    try:
+        comparison_figure = save_temperature_comparison_figure(business_date_value, diagnostics)
+    except Exception as exc:
+        diagnostics["temp_mean_comparison_figure_error"] = str(exc)
+    else:
+        if comparison_figure:
+            diagnostics["temp_mean_comparison_figure"] = comparison_figure
     return diagnostics
 
 
@@ -1676,9 +1879,13 @@ class HistoricalVIIRSClient(BaseVIIRSClient):
         target_latitudes_desc: np.ndarray,
     ) -> np.ndarray | None:
         if h5py is None:
+            runtime_detail = _describe_h5py_runtime()
             raise RuntimeError(
-                "h5py is required to read historical standard VIIRS (VNP10C1). "
-                "Please install h5py in the plugin runtime environment."
+                "\u8bfb\u53d6\u5386\u53f2\u6807\u51c6 VIIRS \u79ef\u96ea\u4ea7\u54c1 (VNP10C1) \u65f6\u9700\u8981 h5py\uff0c"
+                "\u4f46\u5f53\u524d\u63d2\u4ef6\u8fd0\u884c\u73af\u5883\u65e0\u6cd5\u5bfc\u5165\u5b83\u3002\n"
+                f"\u8fd0\u884c\u73af\u5883: {sys.executable}\n"
+                f"h5py \u8be6\u60c5: {runtime_detail}\n"
+                "\u8bf7\u5728\u5b9e\u9645\u542f\u52a8\u8be5\u684c\u9762\u7cfb\u7edf\u7684 Python \u73af\u5883\u4e2d\u5b89\u88c5 h5py\u3002"
             )
         with h5py.File(granule_path, "r") as handle:
             data_group = handle["HDFEOS/GRIDS/VIIRS_Daily_SnowCover_CMG/Data Fields"]
@@ -1755,7 +1962,14 @@ class HistoricalVIIRSClient(BaseVIIRSClient):
         working_lons, working_lats, _ = self._normalize_target_grid(target_longitudes, target_latitudes)
         results: dict[date, tuple[np.ndarray | None, str]] = {}
         missing_dates: list[date] = []
-        for business_date_value in business_dates:
+        total_dates = len(business_dates)
+        for index, business_date_value in enumerate(business_dates, start=1):
+            if _should_report_step(index, total_dates, every=21):
+                emit_progress(
+                    f"正在检查历史 VIIRS 雪盖缓存（{index}/{total_dates} 天）。",
+                    stage="training_viirs",
+                    percent=index / max(total_dates, 1) * 100.0,
+                )
             cached_cover, cached_status = self._load_daily_cache(business_date_value, working_lons, working_lats)
             if cached_cover is not None and cached_status is not None:
                 results[business_date_value] = (cached_cover.astype(np.float32), cached_status)
@@ -1763,8 +1977,19 @@ class HistoricalVIIRSClient(BaseVIIRSClient):
                 missing_dates.append(business_date_value)
 
         if missing_dates and self.remote_token:
+            emit_progress(
+                f"有 {len(missing_dates)} 天历史 VIIRS 缓存缺失，正在尝试在线补齐。",
+                stage="training_viirs",
+            )
             granules = self._search_remote_granules(min(missing_dates), max(missing_dates))
-            for business_date_value in missing_dates:
+            total_missing = len(missing_dates)
+            for index, business_date_value in enumerate(missing_dates, start=1):
+                if _should_report_step(index, total_missing, every=10):
+                    emit_progress(
+                        f"正在补取历史 VIIRS 雪盖（{index}/{total_missing} 天）。",
+                        stage="training_viirs",
+                        percent=index / max(total_missing, 1) * 100.0,
+                    )
                 granule_url = granules.get(business_date_value)
                 if granule_url is None:
                     results[business_date_value] = (None, "missing")
@@ -1783,6 +2008,11 @@ class HistoricalVIIRSClient(BaseVIIRSClient):
 
                 self._save_daily_cache(business_date_value, working_lons, working_lats, cover, HISTORICAL_VIIRS_STATUS)
                 results[business_date_value] = (cover.astype(np.float32), HISTORICAL_VIIRS_STATUS)
+        elif missing_dates:
+            emit_progress(
+                f"历史 VIIRS 本地缓存仍缺少 {len(missing_dates)} 天，后续会按缺测回退策略处理。",
+                stage="training_viirs",
+            )
 
         for business_date_value in business_dates:
             results.setdefault(business_date_value, (None, "missing"))
@@ -1830,6 +2060,119 @@ class Era5PseudoLabelTrainer:
         finally:
             dataset.close()
 
+    @staticmethod
+    def _load_model_bundle(
+        model_path: Path,
+    ) -> tuple[dict[str, Any] | None, list[str], str | None]:
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                bundle = joblib.load(model_path)
+        except Exception as exc:
+            return None, [], str(exc) or repr(exc)
+
+        warning_messages: list[str] = []
+        for warning in caught:
+            message = str(warning.message).strip()
+            if message and message not in warning_messages:
+                warning_messages.append(message)
+
+        if not isinstance(bundle, dict):
+            return None, warning_messages, "模型文件内容无法识别。"
+        if not metadata_signature_matches(bundle):
+            return None, warning_messages, "模型配置与当前分支的 SWE 训练参数不一致。"
+        return dict(bundle), warning_messages, None
+
+    @staticmethod
+    def _report_model_load_warnings(source_label: str, warning_messages: list[str]) -> None:
+        if not warning_messages:
+            return
+        version_warning = next(
+            (
+                message
+                for message in warning_messages
+                if "version" in message.lower() or "unpickle estimator" in message.lower()
+            ),
+            None,
+        )
+        if version_warning:
+            emit_progress(
+                f"{source_label}的模型来自不同的 scikit-learn 版本，系统已优先复用；如需完全重建，可勾选“重新训练模型”。",
+                stage="model",
+            )
+            return
+        emit_progress(f"{source_label}的模型加载时出现兼容性提示，系统已继续复用。", stage="model")
+
+    @staticmethod
+    def _external_model_candidates() -> list[tuple[Path, Path | None, str]]:
+        repo_root = BASE_DIR.parents[1]
+        current_worktree_dir = repo_root.parent
+        worktrees_root = current_worktree_dir.parent
+        if not worktrees_root.exists() or worktrees_root.name.lower() != "worktrees":
+            return []
+
+        candidates: list[tuple[Path, Path | None, str]] = []
+        repo_name = repo_root.name
+        current_model_path = MODEL_PATH.resolve()
+        for worktree_dir in worktrees_root.iterdir():
+            if not worktree_dir.is_dir():
+                continue
+            candidate_model = (
+                worktree_dir
+                / repo_name
+                / "algorithms"
+                / "swe"
+                / "output"
+                / "daily_ml"
+                / "models"
+                / MODEL_PATH.name
+            )
+            if not candidate_model.exists():
+                continue
+            try:
+                if candidate_model.resolve() == current_model_path:
+                    continue
+            except OSError:
+                pass
+            metrics_path = candidate_model.with_name(TRAINING_METRICS_PATH.name)
+            source_label = f"工作树 {worktree_dir.name}"
+            candidates.append((candidate_model, metrics_path if metrics_path.exists() else None, source_label))
+
+        candidates.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+        return candidates
+
+    def _try_reuse_model_from_other_worktrees(self) -> dict[str, Any] | None:
+        emit_progress("当前分支没有可直接使用的 SWE 模型，正在查找本机其它工作树里的可复用模型。", stage="model")
+        for model_path, metrics_path, source_label in self._external_model_candidates():
+            emit_progress(f"发现{source_label}的候选模型，正在校验是否可直接复用。", stage="model")
+            bundle, warning_messages, _ = self._load_model_bundle(model_path)
+            if bundle is None:
+                emit_progress(f"{source_label}的候选模型未通过校验，本次跳过。", stage="model")
+                continue
+
+            MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(model_path, MODEL_PATH)
+                if metrics_path is not None and metrics_path.exists():
+                    shutil.copy2(metrics_path, TRAINING_METRICS_PATH)
+            except OSError:
+                emit_progress(
+                    f"已识别到{source_label}的可用模型，但同步到当前分支时失败；本次会直接复用该模型继续计算。",
+                    stage="model",
+                )
+                bundle["model_path"] = str(model_path)
+            else:
+                emit_progress(f"已从{source_label}同步可用模型到当前分支，后续运行会优先直接复用。", stage="model")
+                bundle["model_path"] = str(MODEL_PATH)
+
+            self._report_model_load_warnings(source_label, warning_messages)
+            bundle["model_source"] = "reused_other_worktree"
+            bundle["model_source_label"] = source_label
+            return bundle
+
+        emit_progress("没有找到可直接复用的已有模型，本次会进入首次训练。", stage="model")
+        return None
+
     def _download_label_dataset(self, start_date: date, end_date: date, target_path: Path) -> Path:
         try:
             import cdsapi
@@ -1846,13 +2189,31 @@ class Era5PseudoLabelTrainer:
         chunk_dir.mkdir(parents=True, exist_ok=True)
 
         chunk_paths: list[Path] = []
+        chunk_ranges: list[tuple[date, date, Path]] = []
         cursor = start_date.replace(day=1)
         while cursor <= end_date:
             next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
             chunk_start = max(start_date, cursor)
             chunk_end = min(end_date, next_month - timedelta(days=1))
             chunk_path = chunk_dir / f"era5_land_{chunk_start:%Y%m%d}_{chunk_end:%Y%m%d}.nc"
-            if not chunk_path.exists():
+            chunk_ranges.append((chunk_start, chunk_end, chunk_path))
+            cursor = next_month
+
+        total_chunks = len(chunk_ranges)
+        for chunk_index, (chunk_start, chunk_end, chunk_path) in enumerate(chunk_ranges, start=1):
+            progress = chunk_index / max(total_chunks, 1) * 100.0
+            if chunk_path.exists():
+                emit_progress(
+                    f"已复用 ERA5-Land 训练标签（月块 {chunk_index}/{total_chunks}，{chunk_start:%Y-%m}）。",
+                    stage="training_labels",
+                    percent=progress,
+                )
+            else:
+                emit_progress(
+                    f"正在下载 ERA5-Land 训练标签（月块 {chunk_index}/{total_chunks}，{chunk_start:%Y-%m}）。",
+                    stage="training_labels",
+                    percent=progress,
+                )
                 days = pd.date_range(chunk_start, chunk_end, freq="D")
                 request = {
                     "variable": ["snow_depth", "snow_depth_water_equivalent", "2m_temperature"],
@@ -1870,7 +2231,6 @@ class Era5PseudoLabelTrainer:
                 }
                 client.retrieve("reanalysis-era5-land", request, str(chunk_path))
             chunk_paths.append(chunk_path)
-            cursor = next_month
 
         datasets: list[xr.Dataset] = []
         try:
@@ -1881,6 +2241,7 @@ class Era5PseudoLabelTrainer:
                     dataset = dataset.rename({"valid_time": "time"})
                 datasets.append(dataset.load())
 
+            emit_progress("ERA5-Land 训练标签已就绪，正在合并月块文件。", stage="training_labels")
             combined = xr.concat(datasets, dim="time").sortby("time")
             combined.to_netcdf(target_path)
             combined.close()
@@ -1895,13 +2256,16 @@ class Era5PseudoLabelTrainer:
         if requested_archive != LEGACY_ERA5_ARCHIVE:
             candidate_archives.append(LEGACY_ERA5_ARCHIVE)
 
+        emit_progress("正在检查 ERA5-Land 训练标签缓存。", stage="training_labels")
         for archive_path in candidate_archives:
             if not archive_path.exists():
                 continue
             dataset_path = self._extract_label_dataset(archive_path)
             if self._label_dataset_covers(dataset_path, TRAINING_START_DATE, TRAINING_END_DATE):
+                emit_progress("已找到可复用的 ERA5-Land 训练标签缓存。", stage="training_labels")
                 return dataset_path
 
+        emit_progress("本地缺少完整的 ERA5-Land 训练标签，将开始自动补齐。", stage="training_labels")
         downloaded_archive = self._download_label_dataset(TRAINING_START_DATE, TRAINING_END_DATE, requested_archive)
         dataset_path = self._extract_label_dataset(downloaded_archive)
         if not self._label_dataset_covers(dataset_path, TRAINING_START_DATE, TRAINING_END_DATE):
@@ -1934,8 +2298,14 @@ class Era5PseudoLabelTrainer:
         label_lons: np.ndarray,
         label_lats: np.ndarray,
     ) -> dict[date, tuple[np.ndarray | None, str]]:
+        emit_progress(f"正在准备历史 VIIRS 雪盖约束（共 {len(dates)} 天）。", stage="training_viirs")
         viirs_client = HistoricalVIIRSClient()
         daily_cover = viirs_client.prefetch_snow_cover_range(dates, label_lons, label_lats)
+        available_days = sum(1 for cover, _ in daily_cover.values() if cover is not None)
+        emit_progress(
+            f"历史 VIIRS 雪盖约束已准备完成，可用 {available_days} 天，缺测 {max(len(dates) - available_days, 0)} 天。",
+            stage="training_viirs",
+        )
         return {
             business_date_value: (cover.astype(np.float32) if cover is not None else None, status)
             for business_date_value, (cover, status) in daily_cover.items()
@@ -1944,13 +2314,16 @@ class Era5PseudoLabelTrainer:
     def prepare_training_frame(self, force_rebuild: bool = False) -> tuple[pd.DataFrame, dict[str, Any]]:
         cache_path = CACHE_DIR / "training_frame.pkl"
         metadata_path = CACHE_DIR / "training_frame_meta.json"
+        emit_progress("正在检查本地训练样本缓存。", stage="training_frame")
         if cache_path.exists() and metadata_path.exists() and not force_rebuild:
             cached_frame = pd.read_pickle(cache_path)
             cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             required_columns = set(FEATURE_COLUMNS + ["date", "swe_mm"])
             if required_columns.issubset(cached_frame.columns) and metadata_signature_matches(cached_metadata):
+                emit_progress(f"已复用本地训练样本缓存（{len(cached_frame):,} 条记录）。", stage="training_frame")
                 return cached_frame, cached_metadata
 
+        emit_progress("正在准备首次训练所需的历史样本。", stage="training_frame")
         label_path = self._ensure_label_dataset()
         dataset = xr.open_dataset(label_path, engine="netcdf4")
         if "valid_time" in dataset.coords:
@@ -1980,7 +2353,14 @@ class Era5PseudoLabelTrainer:
         viirs_daily = self._prefetch_training_viirs([timestamp.date() for timestamp in timestamps], label_lons, label_lats)
 
         frames: list[pd.DataFrame] = []
-        for timestamp in timestamps:
+        total_timestamps = len(timestamps)
+        for index, timestamp in enumerate(timestamps, start=1):
+            if _should_report_step(index, total_timestamps, every=14):
+                emit_progress(
+                    f"正在构建训练样本特征（{index}/{total_timestamps} 天）。",
+                    stage="training_frame",
+                    percent=index / max(total_timestamps, 1) * 100.0,
+                )
             swe_mm = daily_swe.sel(time=timestamp).values.astype(np.float32)
             depth_m = daily_depth.sel(time=timestamp).values.astype(np.float32)
             temp_mean = daily_tmean.sel(time=timestamp).values.astype(np.float32)
@@ -2131,14 +2511,30 @@ class Era5PseudoLabelTrainer:
             "training_temperature_dem_status": training_temp_correction_context["status"],
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        emit_progress(f"训练样本准备完成，共生成 {len(frame):,} 条记录。", stage="training_frame")
         return frame, metadata
 
     def train_or_load_model(self, force_retrain: bool = False) -> dict[str, Any]:
-        if MODEL_PATH.exists() and not force_retrain:
-            bundle = joblib.load(MODEL_PATH)
-            if metadata_signature_matches(bundle):
+        if force_retrain:
+            emit_progress("已选择重新训练模型，本次会跳过已有模型直接重建。", stage="model")
+        elif MODEL_PATH.exists():
+            emit_progress("正在检查当前分支已有的 SWE 模型。", stage="model")
+            bundle, warning_messages, _ = self._load_model_bundle(MODEL_PATH)
+            if bundle is not None:
+                emit_progress("已找到当前分支已有模型，直接复用，无需重新训练。", stage="model")
+                self._report_model_load_warnings("当前分支", warning_messages)
+                bundle["model_source"] = "current_branch"
+                bundle["model_source_label"] = "当前分支"
+                bundle["model_path"] = str(MODEL_PATH)
                 return bundle
+            emit_progress("当前分支已有模型暂时不能直接复用，系统会继续检查其它工作树里的可用模型。", stage="model")
 
+        if not force_retrain:
+            reused_bundle = self._try_reuse_model_from_other_worktrees()
+            if reused_bundle is not None:
+                return reused_bundle
+
+        emit_progress("没有找到可直接复用的模型，本次将开始首次训练。", stage="training")
         training_frame, metadata = self.prepare_training_frame(force_rebuild=force_retrain)
         unique_dates = sorted(pd.to_datetime(training_frame["date"]).dt.date.unique())
         split_index = max(int(len(unique_dates) * 0.8), 1)
@@ -2153,6 +2549,10 @@ class Era5PseudoLabelTrainer:
         x_valid = valid_df[FEATURE_COLUMNS]
         y_valid = valid_df["swe_mm"].to_numpy(dtype=np.float32)
 
+        emit_progress(
+            f"训练样本已就绪，正在训练 SWE 模型（训练样本 {len(train_df):,} 条，验证样本 {len(valid_df):,} 条）。",
+            stage="training",
+        )
         model = HistGradientBoostingRegressor(
             loss="squared_error",
             learning_rate=0.05,
@@ -2193,8 +2593,10 @@ class Era5PseudoLabelTrainer:
             **temperature_correction_signature(),
         }
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        emit_progress("模型训练完成，正在保存模型和训练指标。", stage="training")
         joblib.dump(bundle, MODEL_PATH)
         TRAINING_METRICS_PATH.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        emit_progress("SWE 模型已准备完成。", stage="training")
         return bundle
 
 
@@ -2442,7 +2844,9 @@ def run_business_day(
     observed_snow_cover_override: np.ndarray | None = None,
     viirs_status_override: str | None = None,
 ) -> DailyEntry:
+    emit_progress(f"正在准备 {business_date_value.isoformat()} 的气象驱动。", stage="daily_compute")
     forcing = forcing_override if forcing_override is not None else gfs_client.get_business_day_forcing(business_date_value)
+    emit_progress(f"正在读取 {business_date_value.isoformat()} 的前一日 SWE 状态。", stage="daily_compute")
     prev_swe_mm, used_cold_start = _load_previous_swe(business_date_value, forcing)
     if observed_snow_cover_override is not None or viirs_status_override is not None:
         observed_snow_cover = (
@@ -2452,6 +2856,7 @@ def run_business_day(
         )
         viirs_status = viirs_status_override or "missing"
     else:
+        emit_progress(f"正在获取 {business_date_value.isoformat()} 的 VIIRS 雪盖约束。", stage="daily_compute")
         observed_snow_cover, viirs_status = _candidate_viirs_cover(
             viirs_client,
             business_date_value,
@@ -2460,6 +2865,7 @@ def run_business_day(
         )
 
     history_dates = [business_date_value - timedelta(days=offset) for offset in range(30, 0, -1)]
+    emit_progress(f"正在构建 {business_date_value.isoformat()} 的 SWE 特征并执行模型推理。", stage="daily_compute")
     feature_frame, feature_cover, viirs_available = build_feature_frame(
         forcing,
         prev_swe_mm,
@@ -2502,6 +2908,7 @@ def run_business_day(
     melt_path = RASTER_DIR / f"Snowmelt_mm_day_{day_token}.tif"
     qa_path = RASTER_DIR / f"SWE_QA_{day_token}.tif"
 
+    emit_progress(f"正在写出 {business_date_value.isoformat()} 的 SWE、融雪和 QA 栅格。", stage="daily_compute")
     swe_raster = save_raster(swe_masked, forcing["longitudes"], forcing["latitudes"], swe_path, NODATA_FLOAT, "float32")
     snowmelt_raster = save_raster(
         snowmelt_masked,
@@ -2545,6 +2952,7 @@ def load_existing_results() -> dict[str, Any]:
 
 def ensure_model(force_retrain: bool = False) -> dict[str, Any]:
     ensure_directories()
+    emit_progress("正在准备 SWE 模型。", stage="model")
     trainer = Era5PseudoLabelTrainer(GFSClient())
     return trainer.train_or_load_model(force_retrain=force_retrain)
 
@@ -2556,11 +2964,14 @@ def _resolve_update_target_inputs(
     fallback_viirs_client: BaseVIIRSClient | None = None,
 ) -> tuple[date, dict[str, Any] | None, np.ndarray | None, str | None]:
     candidate_date = current_business_date()
+    emit_progress(f"正在检查 {candidate_date.isoformat()} 是否已有完整 SWE 结果。", stage="daily_update")
     existing_entry = _find_manifest_entry(manifest, candidate_date)
     if _manifest_entry_is_reusable(existing_entry) and _entry_has_available_viirs(existing_entry):
+        emit_progress(f"{candidate_date.isoformat()} 已有完整结果，可以直接加载。", stage="daily_update")
         return candidate_date, None, None, None
 
     try:
+        emit_progress(f"正在尝试获取 {candidate_date.isoformat()} 的最新驱动和雪盖约束。", stage="daily_update")
         forcing = gfs_client.get_business_day_forcing(candidate_date)
         observed_snow_cover, viirs_status = _candidate_viirs_cover(
             viirs_client,
@@ -2569,15 +2980,22 @@ def _resolve_update_target_inputs(
             fallback_viirs_client=fallback_viirs_client,
         )
         if _viirs_cover_is_complete(observed_snow_cover, viirs_status):
+            emit_progress(f"{candidate_date.isoformat()} 的驱动和雪盖约束已准备完成。", stage="daily_update")
             return candidate_date, forcing, observed_snow_cover, viirs_status
     except Exception:
         pass
 
-    return candidate_date - timedelta(days=1), None, None, None
+    fallback_date = candidate_date - timedelta(days=1)
+    emit_progress(
+        f"{candidate_date.isoformat()} 的数据暂未完整到位，系统会自动回退到 {fallback_date.isoformat()} 继续更新。",
+        stage="daily_update",
+    )
+    return fallback_date, None, None, None
 
 
 def run_update_latest(force_retrain: bool = False) -> dict[str, Any]:
     ensure_directories()
+    emit_progress("正在准备“更新最新 SWE”任务。", stage="daily_update")
     manifest = read_manifest()
     gfs_client = GFSClient()
     viirs_client = RealtimeVIIRSClient()
@@ -2596,9 +3014,11 @@ def run_update_latest(force_retrain: bool = False) -> dict[str, Any]:
     if not force_retrain:
         existing_entry = _find_manifest_entry(manifest, target_date)
         if _manifest_entry_is_reusable(existing_entry):
+            emit_progress(f"{target_date.isoformat()} 的 SWE 结果已经存在，界面将直接加载已有结果。", stage="daily_update")
             return build_result_payload(manifest, preferred_business_date=target_date)
 
     model_bundle = ensure_model(force_retrain=force_retrain)
+    emit_progress(f"模型已就绪，开始更新 {target_date.isoformat()} 的 SWE 结果。", stage="daily_update")
     entry = run_business_day(
         target_date,
         model_bundle,
@@ -2612,6 +3032,7 @@ def run_update_latest(force_retrain: bool = False) -> dict[str, Any]:
     )
     manifest = upsert_manifest_entry(entry)
     write_daily_series(manifest)
+    emit_progress("最新 SWE 结果已写入清单，界面正在刷新。", stage="daily_update")
     return build_result_payload(manifest, preferred_business_date=target_date)
 
 
@@ -2620,6 +3041,7 @@ def run_backfill(days_back: int = 7, force_retrain: bool = False) -> dict[str, A
     if days_back <= 0:
         raise ValueError("days_back must be greater than zero.")
 
+    emit_progress(f"正在准备最近 {days_back} 天的 SWE 回算任务。", stage="backfill")
     latest_date = latest_complete_business_date()
     start_date = latest_date - timedelta(days=days_back - 1)
     target_dates = [start_date + timedelta(days=offset) for offset in range(days_back)]
@@ -2632,6 +3054,7 @@ def run_backfill(days_back: int = 7, force_retrain: bool = False) -> dict[str, A
             if not _manifest_entry_is_reusable(_find_manifest_entry(manifest, business_date_value))
         ]
         if not pending_dates:
+            emit_progress(f"最近 {days_back} 天的 SWE 结果都已存在，界面将直接加载已有结果。", stage="backfill")
             return build_result_payload(manifest)
 
     model_bundle = ensure_model(force_retrain=force_retrain)
@@ -2639,7 +3062,9 @@ def run_backfill(days_back: int = 7, force_retrain: bool = False) -> dict[str, A
     viirs_client = RealtimeVIIRSClient()
     fallback_viirs_client = HistoricalVIIRSClient()
 
-    for business_date_value in pending_dates:
+    total_pending = len(pending_dates)
+    for index, business_date_value in enumerate(pending_dates, start=1):
+        emit_progress(f"正在回算 {business_date_value.isoformat()}（{index}/{total_pending}）。", stage="backfill")
         entry = run_business_day(
             business_date_value,
             model_bundle,
@@ -2651,6 +3076,7 @@ def run_backfill(days_back: int = 7, force_retrain: bool = False) -> dict[str, A
         manifest = upsert_manifest_entry(entry)
 
     write_daily_series(manifest)
+    emit_progress("最近所选日期的 SWE 回算结果已全部写入。", stage="backfill")
     return build_result_payload(manifest)
 
 
