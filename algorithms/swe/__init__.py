@@ -1,5 +1,6 @@
 from .swe_assessment import (
     ensure_swe_model,
+    load_existing_results,
     run_backfill_swe,
     run_swe_assessment,
     run_update_latest_swe,
@@ -7,6 +8,7 @@ from .swe_assessment import (
 
 __all__ = [
     "ensure_swe_model",
+    "load_existing_results",
     "run_backfill_swe",
     "run_swe_assessment",
     "run_update_latest_swe",
