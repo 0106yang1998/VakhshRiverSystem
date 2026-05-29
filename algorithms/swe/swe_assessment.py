@@ -235,6 +235,10 @@ def ensure_swe_model(
     )
 
 
+def load_existing_results() -> dict[str, Any]:
+    return _run_in_clean_process("load_existing_results")
+
+
 def get_worker_runtime_info() -> dict[str, Any]:
     return _run_in_clean_process("runtime_info")
 
